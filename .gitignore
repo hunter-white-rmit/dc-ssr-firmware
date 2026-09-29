@@ -1,0 +1,37 @@
+# Build output (CMake presets put it in build/<preset>)
+build/
+Debug/
+Release/
+out/
+
+# Compiled artifacts, in case they end up elsewhere
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.o
+*.d
+*.su
+
+# CMake local files
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Editor / tooling caches
+.cache/
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+.idea/
+
+# STM32CubeIDE workspace files (if you ever open it there)
+.metadata/
+.settings/
+*.launch
+
+# OS junk
+Thumbs.db
+.DS_Store
