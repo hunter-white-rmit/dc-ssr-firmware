@@ -85,9 +85,9 @@ void Error_Handler(void);
 #define OUTCMP1_Pin GPIO_PIN_6
 #define OUTCMP1_GPIO_Port GPIOB
 #define OUTCMP1_EXTI_IRQn EXTI4_15_IRQn
-#define OUTCMP2B7_Pin GPIO_PIN_7
-#define OUTCMP2B7_GPIO_Port GPIOB
-#define OUTCMP2B7_EXTI_IRQn EXTI4_15_IRQn
+#define INCMP2_Pin GPIO_PIN_7
+#define INCMP2_GPIO_Port GPIOB
+#define INCMP2_EXTI_IRQn EXTI4_15_IRQn
 
 /* USER CODE BEGIN Private defines */
 
