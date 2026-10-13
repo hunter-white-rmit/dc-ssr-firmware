@@ -36,6 +36,12 @@ static inline void pin_clr (GPIO_TypeDef *port, uint16_t pin) { port->BRR  = pin
    An unpowered U302 (output below ~20 V at the start of precharge) also
    reads L-L, the same as "above 55.6 V". The handover therefore only
    triggers after u302_armed is set by a non-L-L reading during precharge.
+
+   With little output capacitance (no load) the output can pass from
+   ~20 V to above 55.6 V between loop polls, so the non-L-L window is
+   missed. Any OUTCMP1/OUTCMP2 edge during precharge also proves U302 is
+   powered (an unpowered U302 holds both outputs low), so the edge ISRs
+   arm the handover as well.
 */
 #define INPUT_NOT_OV()      ( pin_high(INCMP1_GPIO_Port,  INCMP1_Pin))
 #define INPUT_NOT_UV()      (!pin_high(INCMP2_GPIO_Port,  INCMP2_Pin))
@@ -67,8 +73,8 @@ static bool      sw_raw_last;       // last raw S501 reading
 static uint32_t  t_sw_change;       // tick of the last raw S501 change
 static bool      sw_armed;          // S501 has been seen OFF since reset
 
-static bool      u302_armed;        // U302 has shown a non-L-L code this precharge
-static uint32_t  t_ll_since;        // tick of the last non-L-L reading
+static volatile bool      u302_armed;   // U302 proven powered this precharge (loop or ISR)
+static volatile uint32_t  t_ll_since;   // tick of the last non-L-L reading or U302 edge
 
 // Relay control
 
@@ -249,7 +255,9 @@ void app_loop(void)
             // Any other code proves U302 is powered and below its threshold.
             u302_armed = true;
             t_ll_since = now;
-        } else if (u302_armed && (now - t_ll_since) >= HANDOVER_STABLE_MS) {
+        } else if (u302_armed &&
+                   (int32_t)(now - t_ll_since) >= (int32_t)HANDOVER_STABLE_MS) {
+            // Signed: an edge ISR may have set t_ll_since after 'now' was read.
             if (energise(CCEN_GPIO_Port, CCEN_Pin, STATE_HANDOVER)) {
                 enter_state(STATE_HANDOVER);
             }
@@ -298,6 +306,16 @@ uint32_t      app_get_warnings(void) { return warnings; }
    Priority 0 (EXTI, TIM3) - keep them short, no HAL_Delay, no printing.
 */
 
+// OUTCMP1/OUTCMP2 edge during precharge: U302 is powered. Restart the L-L
+// stability window from this edge so the handover still needs 2 ms of L-L.
+static inline void u302_edge(relay_state_t s)
+{
+    if (s == STATE_PRECHARGE) {
+        u302_armed = true;
+        t_ll_since = HAL_GetTick();
+    }
+}
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     pin_set(SCOPE_GPIO_Port, SCOPE_Pin);            // latency marker
@@ -334,7 +352,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         break;
 
     case OUTCMP1_Pin:
-        // Handover level is polled in the loop; no action on edges.
+        // Handover level is polled in the loop; an edge only proves U302 is powered.
+        u302_edge(s);
         break;
 
     default:
@@ -353,6 +372,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
     pin_set(SCOPE_GPIO_Port, SCOPE_Pin);
 
     relay_state_t s = state;
+    u302_edge(s);
     // OUTCMP2 going high after handover means the output fell below ~45.2 V.
     // Must be caught on this edge: below ~20 V U302 loses VDD1 and reads L-L.
     if ((s == STATE_HANDOVER || s == STATE_ON) && !OUTPUT_ABOVE_45V()) {
