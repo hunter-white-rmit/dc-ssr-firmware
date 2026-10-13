@@ -11,7 +11,9 @@
     After any reset S501 must be seen OFF before the relay will close, so a
     switch left ON does not re-close the relay straight after a fault reset.
 
-    Heartbeat LED (PB3): blinks while running, held off when faulted.
+    Heartbeat LED (PB3): toggles every 100 ms while running. When faulted it
+    toggles every N seconds, where N identifies the first fault that latched
+    (see the fault list below).
 
 */
 
@@ -27,13 +29,14 @@
 /* while idle, an unhealthy input simply holds the relay open.              */
 /* Cleared only by an MCU reset.                                            */
 /* ------------------------------------------------------------------------ */
-#define FAULT_OVERCURRENT       (1u << 0)   /* CCFLT low: TPSI3103 FLT1 trip (~60 A) */
-#define FAULT_INPUT_OV          (1u << 1)   /* INCMP1 low: input bus > 65.8 V        */
-#define FAULT_INPUT_UV          (1u << 2)   /* INCMP2 low: input bus < 48.6 V        */
-#define FAULT_CC_SUPPLY         (1u << 3)   /* CCPGOOD lost while energised          */
-#define FAULT_PRE_SUPPLY        (1u << 4)   /* PREPGOOD lost while energised         */
-#define FAULT_PRECHARGE_TIMEOUT (1u << 5)   /* output never reached handover level   */
-#define FAULT_OUTPUT_COLLAPSE   (1u << 6)   /* OUTCMP2 fell below ~45 V while on     */
+/* Heartbeat toggle period in fault = (bit index + 1) seconds, shown at right. */
+#define FAULT_OVERCURRENT       (1u << 0)   /* 1 s  CCFLT low: TPSI3103 FLT1 trip (~60 A) */
+#define FAULT_INPUT_OV          (1u << 1)   /* 2 s  INCMP1 low: input bus > 65.8 V        */
+#define FAULT_INPUT_UV          (1u << 2)   /* 3 s  INCMP2 low: input bus < 48.6 V        */
+#define FAULT_CC_SUPPLY         (1u << 3)   /* 4 s  CCPGOOD lost while energised          */
+#define FAULT_PRE_SUPPLY        (1u << 4)   /* 5 s  PREPGOOD lost while energised         */
+#define FAULT_PRECHARGE_TIMEOUT (1u << 5)   /* 6 s  output never reached handover level   */
+#define FAULT_OUTPUT_COLLAPSE   (1u << 6)   /* 7 s  OUTCMP2 fell below ~45 V while on     */
 
 // Warning flags: never trips. Visible via debugger, cleared by MCU reset
 #define WARN_OC_ALARM           (1u << 0)   /* CCALM low: TPSI3103 ALM1 (~50 A)      */

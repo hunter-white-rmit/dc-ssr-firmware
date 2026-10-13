@@ -12,7 +12,8 @@ extern TIM_HandleTypeDef htim3;
 #define HANDOVER_STABLE_MS      2u    // L-L must persist across 2 ticks (>= 1 ms real time)
 #define PRECHARGE_TIMEOUT_MS    100u  // nominal ~16 ms for 2 mF; fault if exceeded
 #define HANDOVER_OVERLAP_MS     5u    // CCEN and PREEN both on before PREEN drops
-#define HEARTBEAT_MS            100u  // LED toggle while running; held off when faulted
+#define HEARTBEAT_MS            100u  // LED toggle while running
+#define HEARTBEAT_FAULT_STEP_MS 1000u // LED toggle when faulted: (fault bit index + 1) x this
 
 // Fast pin access functions (for single-cycle register operations)
 static inline bool pin_high(GPIO_TypeDef *port, uint16_t pin) { return (port->IDR & pin) != 0u; }
@@ -54,6 +55,7 @@ static inline void pin_clr (GPIO_TypeDef *port, uint16_t pin) { port->BRR  = pin
 static volatile relay_state_t   state =         STATE_INIT;
 static volatile uint32_t        faults =        0u;
 static volatile uint32_t        warnings =      0u;
+static volatile uint32_t        first_fault =   0u;     // first fault bit latched; sets the blink rate
 
 static uint32_t  t_state_entry;     // tick when current state was entered
 static uint32_t  t_healthy_since;   // tick when inputs last became healthy
@@ -82,11 +84,31 @@ static inline bool is_energised(relay_state_t s)
     return (s == STATE_PRECHARGE) || (s == STATE_HANDOVER) || (s == STATE_ON);
 }
 
+// Record a fault, remembering which one latched first.
+static inline void latch_fault(uint32_t fault_bit)
+{
+    if (faults == 0u) {
+        first_fault = fault_bit;
+    }
+    faults |= fault_bit;
+}
+
 // Called from ISRs: open first, then record.
 static inline void trip(uint32_t fault_bit)
 {
     relay_open_all();
-    faults |= fault_bit;
+    latch_fault(fault_bit);
+}
+
+// Fault blink: bit 0 -> 1 s, bit 1 -> 2 s, ... bit 6 -> 7 s per toggle.
+static uint32_t fault_blink_ms(uint32_t fault_bit)
+{
+    uint32_t n = 1u;
+    while (fault_bit > 1u) {
+        fault_bit >>= 1;
+        n++;
+    }
+    return n * HEARTBEAT_FAULT_STEP_MS;
 }
 
 /*
@@ -187,6 +209,8 @@ void app_loop(void)
     if (faults != 0u && state != STATE_FAULT) {
         relay_open_all();
         enter_state(STATE_FAULT);
+        pin_clr(HEARTBEAT_GPIO_Port, HEARTBEAT_Pin);    // start the fault blink from off
+        t_heartbeat = now;
     }
 
     // ---- S501 OFF opens the relay from any energised state ----
@@ -257,10 +281,9 @@ void app_loop(void)
     // ---- Watchdog: refreshed only from the loop, every pass ----
     HAL_IWDG_Refresh(&hiwdg);
 
-    // ---- Heartbeat LED: blink while running, held off when faulted ----
-    if (state == STATE_FAULT) {
-        pin_clr(HEARTBEAT_GPIO_Port, HEARTBEAT_Pin);
-    } else if ((now - t_heartbeat) >= HEARTBEAT_MS) {
+    // ---- Heartbeat LED: fast while running, slow fault code when faulted ----
+    uint32_t hb = (state == STATE_FAULT) ? fault_blink_ms(first_fault) : HEARTBEAT_MS;
+    if ((now - t_heartbeat) >= hb) {
         t_heartbeat = now;
         HAL_GPIO_TogglePin(HEARTBEAT_GPIO_Port, HEARTBEAT_Pin);
     }
@@ -286,7 +309,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     case CCFLT_Pin:
         if (!CC_NO_TRIP()) {
             relay_open_all();                       // stop TPSI3103 auto-retry
-            if (live) { faults |= FAULT_OVERCURRENT; }
+            if (live) { latch_fault(FAULT_OVERCURRENT); }
         }
         break;
 
