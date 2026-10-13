@@ -33,6 +33,12 @@
 
 // Warning flags: reported, never trips. Cleared by 'r'
 #define WARN_OC_ALARM           (1u << 0)   /* CCALM low: TPSI3103 ALM1 (~50 A)      */
+/* Glitch warnings: line went bad but recovered within CONFIRM_US (no trip).
+   Same bit positions as the matching fault, so W= reads like F=.          */
+#define WARN_GLITCH_INPUT_OV    FAULT_INPUT_OV
+#define WARN_GLITCH_INPUT_UV    FAULT_INPUT_UV
+#define WARN_GLITCH_CC_SUPPLY   FAULT_CC_SUPPLY
+#define WARN_GLITCH_PRE_SUPPLY  FAULT_PRE_SUPPLY
 
 /* ------------------------------------------------------------------------ */
 /* Relay states                                                             */

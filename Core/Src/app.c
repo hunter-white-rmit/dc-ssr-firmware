@@ -17,6 +17,7 @@ extern UART_HandleTypeDef huart1;
 #define HEARTBEAT_MS            250u  // LED toggle, normal
 #define HEARTBEAT_FAULT_MS      80u   // LED toggle, faulted (fast blink)
 #define TELEMETRY_MS            500u  // periodic status line
+#define CONFIRM_US              50u   // OV/UV/PGOOD must stay bad this long to trip
 
 // Fast pin access functions (for single-cycle register operations)
 static inline bool pin_high(GPIO_TypeDef *port, uint16_t pin) { return (port->IDR & pin) != 0u; }
@@ -36,9 +37,11 @@ static inline void pin_clr (GPIO_TypeDef *port, uint16_t pin) { port->BRR  = pin
    Input bus healthy = INCMP1 high, INCMP2 low. A dead U301 supply reads
    as overvoltage, so the relay opens.
 
-   An unpowered U302 (output below ~20 V at the start of precharge) also
-   reads L-L, the same as "above 55.6 V". The handover therefore only
-   triggers after u302_armed is set by a non-L-L reading during precharge.
+   U302 is powered from the input bus, so it is live before precharge
+   starts and reads H-H with the output discharged. L-L at the moment 'o'
+   is sent means the output is already above ~55.6 V (or U302 has lost
+   VDD1). The handover therefore only triggers after u302_armed is set by
+   a non-L-L reading during precharge.
 */
 #define INPUT_NOT_OV()      ( pin_high(INCMP1_GPIO_Port,  INCMP1_Pin))
 #define INPUT_NOT_UV()      (!pin_high(INCMP2_GPIO_Port,  INCMP2_Pin))
@@ -70,6 +73,107 @@ static bool      status_due;
 
 static bool      u302_armed;        // U302 has shown a non-L-L code this precharge
 static uint32_t  t_ll_since;        // tick of the last non-L-L reading
+
+/*
+   Glitch rejection for the OV/UV and PGOOD lines.
+
+   The precharge buck switches 60 V in tens of ns, and single-edge noise on
+   these open-drain lines was latching faults mid-precharge. An edge on one
+   of these lines now only marks the fault as pending. app_loop() trips if
+   the line is still bad CONFIRM_US later, and otherwise drops the event
+   and records it as a glitch warning (same bit position as the fault, so
+   the W= field shows which line glitched).
+
+   Real OV/UV events last milliseconds, so the added latency (CONFIRM_US
+   plus one loop pass) does not weaken protection. Overcurrent (CCFLT) is
+   NOT filtered: the TPSI3103 has already acted on it in hardware.
+
+   Timebase: TIM3 free-runs at 1 MHz (PSC 47, 48 MHz) for OUTCMP2 capture.
+*/
+#define DEBOUNCED_FAULTS  (FAULT_INPUT_OV | FAULT_INPUT_UV | \
+                           FAULT_CC_SUPPLY | FAULT_PRE_SUPPLY)
+
+static volatile uint32_t pending;           // fault bits awaiting confirmation
+static volatile uint32_t recovered;         // pending bits whose line went good again
+static volatile uint16_t t_pending_us[8];   // TIM3 count when each bit went pending
+static volatile uint32_t t_pending_ms[8];   // HAL tick, guards against TIM3 wrap
+
+static inline void trip(uint32_t fault_bit);   // defined below
+
+static inline uint16_t us_now(void) { return (uint16_t)TIM3->CNT; }
+
+static inline uint32_t bit_index(uint32_t bit)
+{
+    uint32_t i = 0u;
+    while ((bit >>= 1) != 0u) { i++; }
+    return i;
+}
+
+// Called from the EXTI ISR for a debounced line.
+static inline void mark_line(uint32_t bit, bool bad)
+{
+    uint32_t i = bit_index(bit);
+    if (bad) {
+        pending   |=  bit;
+        recovered &= ~bit;
+        t_pending_us[i] = us_now();
+        t_pending_ms[i] = HAL_GetTick();
+    } else if ((pending & bit) != 0u) {
+        recovered |= bit;
+    }
+}
+
+// Current level of a debounced line (true = still bad).
+static bool line_bad(uint32_t bit)
+{
+    switch (bit) {
+    case FAULT_INPUT_OV:   return !INPUT_NOT_OV();
+    case FAULT_INPUT_UV:   return !INPUT_NOT_UV();
+    case FAULT_CC_SUPPLY:  return !CC_SUPPLY_OK();
+    case FAULT_PRE_SUPPLY: return !PRE_SUPPLY_OK();
+    default:               return false;
+    }
+}
+
+// Resolve pending events. Call once per loop pass.
+static void confirm_pending(bool live)
+{
+    if (!live) {
+        __disable_irq();
+        pending   = 0u;
+        recovered = 0u;
+        __enable_irq();
+        return;
+    }
+
+    for (uint32_t bit = FAULT_INPUT_OV; bit <= FAULT_PRE_SUPPLY; bit <<= 1) {
+        __disable_irq();
+        bool     is_pending = (pending & bit) != 0u;
+        bool     went_good  = (recovered & bit) != 0u;
+        uint32_t i          = bit_index(bit);
+        uint16_t dt_us      = (uint16_t)(us_now() - t_pending_us[i]);
+        uint32_t dt_ms      = HAL_GetTick() - t_pending_ms[i];
+        __enable_irq();
+
+        if (!is_pending) {
+            continue;
+        }
+        if (went_good || !line_bad(bit)) {
+            // Glitch: drop it, but keep a record for telemetry.
+            __disable_irq();
+            pending   &= ~bit;
+            recovered &= ~bit;
+            warnings  |=  bit;
+            __enable_irq();
+        } else if (dt_us >= CONFIRM_US || dt_ms >= 2u) {
+            // Still bad after the confirm window: real fault.
+            trip(bit);
+            __disable_irq();
+            pending &= ~bit;
+            __enable_irq();
+        }
+    }
+}
 
 static const char *const state_name[] = {
     "INIT", "OFF", "PRECHARGE", "HANDOVER", "ON", "FAULT"
@@ -279,6 +383,9 @@ void app_loop(void)
     uint32_t now       = HAL_GetTick();
     bool     qualified = inputs_qualified(now);
 
+    // ---- Confirm or reject pending OV/UV/PGOOD events ----
+    confirm_pending(is_energised(state));
+
     // ---- Any fault latched by an ISR forces the fault state ----
     if (faults != 0u && state != STATE_FAULT) {
         relay_open_all();
@@ -394,20 +501,21 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         }
         break;
 
+    // Debounced lines: mark pending (or recovered); app_loop() decides.
     case INCMP1_Pin:
-        if (live && !INPUT_NOT_OV()) { trip(FAULT_INPUT_OV); }
+        if (live) { mark_line(FAULT_INPUT_OV,   !INPUT_NOT_OV()); }
         break;
 
     case INCMP2_Pin:
-        if (live && !INPUT_NOT_UV()) { trip(FAULT_INPUT_UV); }
+        if (live) { mark_line(FAULT_INPUT_UV,   !INPUT_NOT_UV()); }
         break;
 
     case CCPGOOD_Pin:
-        if (live && !CC_SUPPLY_OK()) { trip(FAULT_CC_SUPPLY); }
+        if (live) { mark_line(FAULT_CC_SUPPLY,  !CC_SUPPLY_OK()); }
         break;
 
     case PREPGOOD_Pin:
-        if (live && !PRE_SUPPLY_OK()) { trip(FAULT_PRE_SUPPLY); }
+        if (live) { mark_line(FAULT_PRE_SUPPLY, !PRE_SUPPLY_OK()); }
         break;
 
     case CCALM_Pin:
@@ -435,7 +543,8 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 
     relay_state_t s = state;
     // OUTCMP2 going high after handover means the output fell below ~45.2 V.
-    // Must be caught on this edge: below ~20 V U302 loses VDD1 and reads L-L.
+    // U302 is powered from the input bus, so a full collapse to 0 V still
+    // reads H-H here rather than a fail-safe L-L.
     if ((s == STATE_HANDOVER || s == STATE_ON) && !OUTPUT_ABOVE_45V()) {
         trip(FAULT_OUTPUT_COLLAPSE);
     }
