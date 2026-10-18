@@ -6,6 +6,31 @@
 extern IWDG_HandleTypeDef hiwdg;
 extern TIM_HandleTypeDef htim3;
 
+/*
+   TEST BUILD ONLY - final test day plan, T1 step 2 (firmware hang).
+
+   Pull HANG_IN (PF1, Nucleo D8) to GND to simulate a firmware hang.
+   The firmware drives HANG_MARK (PA8, Nucleo D9) high as the scope t = 0
+   reference, then spins forever without refreshing the IWDG. The relay
+   stays in whatever state it was in until the IWDG resets the MCU
+   (nominal 100 ms: reload 125, /32, LSI 40 kHz), after which the GPIOs
+   reset to inputs, the TPSI EN pull-downs hold EN low and the relay opens.
+
+   Interrupts stay enabled during the hang, as in a real main-loop hang,
+   so CCFLT/OV/UV ISRs are still live. Trigger the scope on HANG_MARK.
+
+   Set TEST_HANG_HOOK to 0 (or build from main) for the final firmware.
+*/
+#define TEST_HANG_HOOK          1
+
+#if TEST_HANG_HOOK
+#define HANG_IN_GPIO_Port       GPIOF
+#define HANG_IN_Pin             GPIO_PIN_1      // D8: jumper to GND to hang
+#define HANG_MARK_GPIO_Port     GPIOA
+#define HANG_MARK_Pin           GPIO_PIN_8      // D9: high = hang started (t = 0)
+#define HANG_DEBOUNCE_MS        20u             // stray-pickup rejection only; t = 0 is the marker edge
+#endif
+
 // Tunable timings (in milliseconds unless noted)
 #define QUALIFY_MS              5u    // inputs healthy this long before closing allowed
 #define SWITCH_DEBOUNCE_MS      20u   // S501 must hold a level this long to register
@@ -289,6 +314,45 @@ static void confirm_pending(bool live)
     }
 }
 
+#if TEST_HANG_HOOK
+static void hang_hook_init(void)
+{
+    GPIO_InitTypeDef g = {0};
+
+    pin_clr(HANG_MARK_GPIO_Port, HANG_MARK_Pin);
+    g.Pin   = HANG_MARK_Pin;
+    g.Mode  = GPIO_MODE_OUTPUT_PP;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(HANG_MARK_GPIO_Port, &g);
+
+    g.Pin   = HANG_IN_Pin;
+    g.Mode  = GPIO_MODE_INPUT;
+    g.Pull  = GPIO_PULLUP;                      // open = run, GND = hang
+    HAL_GPIO_Init(HANG_IN_GPIO_Port, &g);
+}
+
+// Call once per loop pass. Never returns once HANG_IN has been low for HANG_DEBOUNCE_MS.
+static void hang_hook_poll(uint32_t now)
+{
+    static uint32_t t_high = 0u;
+
+    if (pin_high(HANG_IN_GPIO_Port, HANG_IN_Pin)) {
+        t_high = now;
+        return;
+    }
+    if ((now - t_high) < HANG_DEBOUNCE_MS) {
+        return;
+    }
+
+    pin_set(HANG_MARK_GPIO_Port, HANG_MARK_Pin);    // t = 0 for the scope
+    for (;;) {
+        // Simulated hang: no HAL_IWDG_Refresh, no state machine, no heartbeat.
+        __NOP();
+    }
+}
+#endif
+
 // Heartbeat LED
 static inline void led_write(bool on)
 {
@@ -365,6 +429,10 @@ void app_init(void)
     sw_armed       = false;
 
     HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_4);     // OUTCMP2 edges, and the 1 MHz timebase
+
+#if TEST_HANG_HOOK
+    hang_hook_init();
+#endif
 }
 
 void app_loop(void)
@@ -373,6 +441,10 @@ void app_loop(void)
     bool     qualified = inputs_qualified(now);
 
     switch_poll(now);
+
+#if TEST_HANG_HOOK
+    hang_hook_poll(now);
+#endif
 
     // ---- Confirm or reject pending OV/UV/PGOOD events ----
     confirm_pending(is_energised(state));
